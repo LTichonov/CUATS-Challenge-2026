@@ -1,0 +1,101 @@
+from AlgorithmImports import *
+from collections import deque
+import numpy as np
+
+
+class multi_asset_deep_signal_plus(QCAlgorithm):
+
+    def initialize(self):
+        self.set_start_date(2004, 1, 1)
+        self.set_cash(100000)
+        self.volume_timeframe = 52*5 #52 trading weeks (5 days each)
+
+        # Universe: Top 40 SNP 500 Constituents by market cap.
+        tickers = ["NVDA","AAPL", "MSFT", "AMZN", "AVGO", "GOOGL", "GOOG", "META", "TSLA", "BRK.B", "LLY", "JPM", "V", "XOM", "MA", "JNJ", "WMT", "ABBV", "BAC", "NFLX", "COST", "PLTR", "AMD", "HD", "MU", "ORCL", "PG", "GE", "UNH", "CSCO", "WFC", "CVX", "GS", "CAT", "IBM", "KO", "MRK", "PM", "CRM", "RTX"]
+
+        #load all equities
+        self.assets = {}
+        for ticker in tickers:
+            symbol = self.add_equity(ticker, Resolution.DAILY).symbol
+            self.securities[symbol].set_data_normalization_mode(
+                DataNormalizationMode.ADJUSTED
+            )
+
+            self.assets[symbol] = {
+                "stoch": Stochastic("stoch_" + ticker, 10, 6, 6), # stochastic oscillator
+                "willr": WilliamsPercentR("willr_" + ticker, 10), # Williams R
+                "volume": deque(maxlen=self.volume_timeframe), # set up rolling list of trading volumes, to be filled weekly
+                "entry_price": None
+            }
+
+            #register needed indicators
+            self.register_indicator(symbol, self.assets[symbol]["stoch"], Resolution.DAILY)
+            self.register_indicator(symbol, self.assets[symbol]["willr"], Resolution.DAILY)
+
+        # Risk controls
+        self.max_leverage = 3
+        self.max_weight_per_asset = self.max_leverage/len(tickers)
+        self.risky_weight = 1 #relative risk taken on based on vix and spy behaviour
+
+        self.set_warm_up(260, Resolution.DAILY)
+
+    def on_data(self, data):
+        if self.is_warming_up:
+            return
+        
+        #update holdings based on our stoch, vol and willr signals
+        for symbol, state in self.assets.items():
+            bar = data.bars.get(symbol)
+
+            #checks
+            if bar is None:
+                continue
+
+            state["volume"].append(float(bar.volume))
+
+            if not state["stoch"].is_ready or not state["willr"].is_ready:
+                continue
+
+            if len(state["volume"]) < self.volume_timeframe:
+                continue
+
+            stoch = state["stoch"].stoch_k.current.value
+            willr = state["willr"].current.value
+
+            #average volume in last week, volume timeframe (52 weeks) and std. dev. of volume
+            current_vol = np.mean([state["volume"][i] for i in range(min(5, len(state["volume"])))])
+            avg_vol = np.mean(state["volume"])
+            std_vol = np.std(state["volume"])
+
+            #define buy and sell signals
+            buy_signal = stoch < 30 and willr < -75
+            sell_signal = stoch > 80 and willr > -20
+
+            invested = self.portfolio[symbol].invested
+
+            # Exit
+            if invested and sell_signal:
+                self.liquidate(symbol)
+                state["entry_price"] = None
+                continue
+
+            # Entry
+            if buy_signal and not invested:
+                leverage = self.determine_leverage(current_vol, avg_vol, std_vol)
+                weight = leverage * self.max_weight_per_asset/3 #max leverage = 3, so max weight sum is adhered to.
+
+                self.set_holdings(symbol, weight)
+                state["entry_price"] = bar.close
+
+    #leverage determined based on volume, as outlined in the paper
+    def determine_leverage(self, current_vol, avg_vol, std_vol):
+        ratio_condition = abs(current_vol - avg_vol) / avg_vol >= 0.20
+        std_condition = abs(current_vol - avg_vol) >= std_vol
+
+        if ratio_condition and std_condition:
+            return 3
+        elif ratio_condition or std_condition:
+            return 2
+        else:
+            return 1
+
